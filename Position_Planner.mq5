@@ -197,6 +197,11 @@ const string STATE_HEADER_V8 = "PPLN_STATE_V8"; // + línea L: baselines de lím
 const string CFG_HEADER_V2   = "PPLN_CFG_V2";
 const string CFG_HEADER_V3   = "PPLN_CFG_V3";
 const string LOCK_HEADER_V1  = "PPLN_LOCK_V1";
+// C-3: dos fases en el lock de instancia — CLAIM (reclamación provisional del
+// handshake) y HEARTBEAT (primaria confirmada). La segunda línea del archivo
+// es siempre "state=<FASE>" para que los lectores distingan ambos casos.
+const string LOCK_STATE_CLAIM     = "CLAIM";
+const string LOCK_STATE_HEARTBEAT = "HEARTBEAT";
 
 #define CFG_MAX_KEYS 256
 
@@ -731,8 +736,8 @@ int    g_auto_template_failures = 0;
 bool   g_is_primary_instance = true;
 long   g_instance_uid        = 0;
 int    g_lock_file_handle    = INVALID_HANDLE;
-bool g_object_name_warned = false;
-bool g_be_stage_warned    = false;
+bool   g_object_name_warned  = false; // usado en la sección de objetos del gráfico
+bool   g_be_stage_warned     = false; // usado en la gestión de break-even
 bool g_state_dirty        = false;
 
 string g_cfg_key[CFG_MAX_KEYS];
@@ -758,12 +763,30 @@ ulong g_next_limits_ms       = 0;
 ulong g_flat_arm_until_ms    = 0;
 ulong g_cancel_arm_until_ms  = 0;
 
+// M-1: cola de cancelaciones diferidas. En cuenta real NO se puede usar
+// Sleep() dentro de CancelPendingOrder (bloquearía el hilo del EA y retrasaría
+// trailing/BE de otras posiciones). Cuando un reintento debe esperar, la
+// orden se encola aquí y el siguiente OnTick/OnTimer reintenta sin bloquear.
+struct SPendingCancel
+{
+   ulong  order_ticket;
+   int    attempt;        // intentos ya consumidos (1-based al encolar)
+   ulong  next_retry_ms;  // momento a partir del cual reintentar
+   string context;
+};
+SPendingCancel g_pending_cancels[];
+
 //+------------------------------------------------------------------+
 //| PROTOTIPOS ADELANTADOS (sin argumentos por defecto)              |
 //+------------------------------------------------------------------+
 void   SetPanelStatus(string text, bool problem);
 void   UpdatePanelInfo();
 void   MarkPanelDirty();
+bool   IsRetryableRetcode(uint retcode);
+bool   IsSuccessfulTradeRetcode(uint retcode);
+string TradeResultText();
+bool   PositionBelongsToEA(ulong ticket);
+int    FindPositionByOrderTicket(ulong order_ticket);
 void   RefreshPartialCheckboxes();
 void   RefreshManagementToggles();
 void   RecalculateAllPositions();
@@ -774,6 +797,10 @@ void   UpdatePositionObjects(int idx);
 void   SynchronizeLockedDraftZones();
 void   LogExecution(string message, bool is_problem);
 bool   CancelPendingOrder(ulong order_ticket, string context);
+void   QueuePendingCancel(ulong order_ticket, int attempt, ulong delay_ms, string context);
+void   ProcessPendingCancels();
+void   FinishPendingCancel(ulong order_ticket, bool success, string context);
+void   RemovePendingCancelAt(int idx);
 void   ExecuteSelectedOrder();
 void   ResetRuntimeState();
 void   RaisePanelCanvasToFront();
@@ -6037,6 +6064,7 @@ void   UpdateLimitBaselines(bool force);
 void   AdoptOrphanPositions();
 void   VerifyProtectiveLevels();
 void   HideNativeTradeLevels();
+void   ProcessPendingCancels(); // M-1: cola de cancelaciones diferidas (OnTick/OnTimer)
 void   WriteInstanceHeartbeat();
 void   LoadPositionsState();
 void   LoadSavedConfig();
@@ -6663,10 +6691,16 @@ void LoadPositionsState()
 //| PERSISTENCIA - LOCK DE INSTANCIA                                 |
 //| (adquisición, heartbeat y revalidación anti doble-primaria)      |
 //+------------------------------------------------------------------+
-bool ReadLockFileFields(string &out_uid, string &out_heartbeat)
+// Lee los campos persistentes del archivo de lock. NOTA DE DISEÑO: el campo
+// "written" SIEMPRE es el último que la primaria escribe en el archivo (ver
+// WriteInstanceHeartbeat). Por eso puede usarse como marca de escritura
+// COMPLETA: si tras una lectura no aparece, la otra instancia interrumpió su
+// escritura entre medias y ese heartbeat NO debe considerarse válido.
+bool ReadLockFileFields(string &out_uid, string &out_heartbeat, string &out_written)
 {
    out_uid       = "";
    out_heartbeat = "";
+   out_written   = "";
 
    int h = FileOpen(LockFileName(),
                     FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON |
@@ -6683,8 +6717,11 @@ bool ReadLockFileFields(string &out_uid, string &out_heartbeat)
          out_uid = StringSubstr(line, 4);
 
       if(StringFind(line, "heartbeat=") == 0)
-      {
          out_heartbeat = StringSubstr(line, StringLen("heartbeat="));
+
+      if(StringFind(line, "written=") == 0)
+      {
+         out_written = StringSubstr(line, StringLen("written="));
          break;
       }
    }
@@ -6693,16 +6730,55 @@ bool ReadLockFileFields(string &out_uid, string &out_heartbeat)
    return true;
 }
 
+// Versión de conveniencia para los consumidores que no necesitan distinguir
+// heartbeat de marca de finalización.
+bool ReadLockFileFields(string &out_uid, string &out_heartbeat)
+{
+   string written;
+   return ReadLockFileFields(out_uid, out_heartbeat, written);
+}
+
+// Valida un registro de lock leído del disco:
+//  - uid numérico (> 0),
+//  - heartbeat parseable (> 0),
+//  - marca de escritura completa ("written") presente y coincidente con el
+//    heartbeat (descarta lecturas parciales de una escritura ajena en curso).
+// Devuelve además el momento del heartbeat en hb_out.
+bool ParseValidatedLockRecord(string uid_text, string hb_text, string written_text,
+                              long &out_uid, datetime &hb_out)
+{
+   out_uid = 0;
+   hb_out  = 0;
+
+   if(uid_text == "" || hb_text == "" || written_text == "") return false;
+
+   long uid = (long)StringToInteger(uid_text);
+   if(uid <= 0) return false;
+
+   datetime hb = StringToTime(hb_text);
+   if(hb <= 0) return false;
+
+   // "written" es lo último que se escribe: si falta o difiere del heartbeat,
+   // la escritura quedó truncada por una lectura/escritura concurrente.
+   if(written_text != hb_text) return false;
+
+   out_uid = uid;
+   hb_out  = hb;
+   return true;
+}
+
 bool IsLockFileHeldByLiveInstance()
 {
-   string uid, hb_text;
-   if(!ReadLockFileFields(uid, hb_text)) return false;
+   string uid_text, hb_text, written_text;
+   if(!ReadLockFileFields(uid_text, hb_text, written_text)) return false;
 
-   datetime heartbeat = (hb_text == "") ? 0 : StringToTime(hb_text);
-   if(heartbeat <= 0) return false;
+   long     uid;
+   datetime hb;
+   if(!ParseValidatedLockRecord(uid_text, hb_text, written_text, uid, hb)) return false;
 
-   int stale_after_sec = (INSTANCE_HB_PERIOD_MS / 1000) * 6;
-   return (TimeCurrent() - heartbeat) <= stale_after_sec;
+   // Ventana de obsolescencia: 6 ciclos de heartbeat (≈30 s), coherente con
+   // VerifyLockOwnership y con INSTANCE_HB_STALE_SEC.
+   return (TimeCurrent() - hb) <= INSTANCE_HB_STALE_SEC;
 }
 
 bool AcquireInstanceLock()
@@ -6725,41 +6801,52 @@ bool AcquireInstanceLock()
 
    if(g_lock_file_handle != INVALID_HANDLE)
    {
-      // IMPORTANTE: FileOpen(FILE_WRITE) NO es un bloqueo exclusivo en MQL5 —
-      // dos gráficos pueden abrirlo a la vez. Por eso, tras adquirirlo, se
-      // revalida leyendo el contenido: si otro gráfico ya escribió su uid con
-      // heartbeat fresco, este gráfico degrada a OBSERVADOR y cede el handle.
+      // C-3 (primera capa): FileOpen(FILE_WRITE) sin flags SHARE otorga
+      // EXCLUSIVIDAD a nivel del sandbox de terminal_common: cualquier otra
+      // instancia (aunque sea de otro terminal instalado en la máquina)
+      // recibirá ACCESS_DENIED mientras este handle permanezca abierto. Es la
+      // primera línea de defensa anti doble-primaria; las otras dos capas son:
+      //   - revalidación post-escritura aquí mismo (ventana de solapamiento en
+      //     el instante exacto del arranque simultáneo),
+      //   - VerifyLockOwnership periódico + degradación determinista por uid
+      //     (recupera el orden correcto si aun así hubiera dos primarias).
+      // El handle debe mantenerse ABIERTO durante toda la vida de la primaria:
+      // cerrarlo dejaría el archivo libre para otra instancia.
       WriteInstanceHeartbeat();
 
-      string uid, hb_text;
-      datetime my_hb = TimeCurrent();
-
-      if(ReadLockFileFields(uid, hb_text))
+      string uid_text, hb_text, written_text;
+      if(ReadLockFileFields(uid_text, hb_text, written_text))
       {
-         datetime hb = (hb_text == "") ? 0 : StringToTime(hb_text);
-         long other_uid = (long)StringToInteger(uid);
+         long     other_uid;
+         datetime other_hb;
+         bool valid_other = ParseValidatedLockRecord(uid_text, hb_text, written_text,
+                                                     other_uid, other_hb);
 
-         // Heartbeat fresco escrito por OTRO chart => hay una primaria viva.
-         if(other_uid != 0 && other_uid != g_instance_uid &&
-            hb >= my_hb - 2 && IsLockFileHeldByLiveInstance())
+         if(valid_other && other_uid != g_instance_uid &&
+            (TimeCurrent() - other_hb) <= INSTANCE_HB_STALE_SEC)
          {
             FileClose(g_lock_file_handle);
-            g_lock_file_handle      = INVALID_HANDLE;
+            g_lock_file_handle = INVALID_HANDLE;
+
             g_is_primary_instance   = false;
             g_lock_owner_verified   = false;
+            g_next_lock_retry_ms    = NowMs() + (ulong)INSTANCE_LOCK_RETRY_MS;
 
-            PrintFormat("%s: otra instancia (chart %I64d) ya escribió un heartbeat fresco " +
-                        "en %s pese a que este gráfico pudo abrirlo. Arranca en MODO " +
-                        "OBSERVADOR para evitar doble gestión.",
-                        APP_NAME, other_uid, LockFileName());
+            PrintFormat("%s: AVISO — dos instancias abrieron el bloqueo casi a la vez; " +
+                        "el chart %I64d escribió un heartbeat vigente, así que este gráfico " +
+                        "(chart %I64d) arranca en MODO OBSERVADOR y reintentará en ~%d s.",
+                        APP_NAME, other_uid, g_instance_uid,
+                        INSTANCE_LOCK_RETRY_MS / 1000);
             return false;
          }
       }
 
-      g_is_primary_instance = true;
-      g_lock_owner_verified = true;
+      g_is_primary_instance   = true;
+      g_lock_owner_verified   = true;
+      g_next_lock_retry_ms    = 0; // primaria: no necesita reintentos de promoción
 
-      PrintFormat("%s: instancia PRIMARIA (bloqueo %s adquirido y revalidado).", APP_NAME, LockFileName());
+      PrintFormat("%s: bloqueo de instancia adquirido (heartbeats validados sin " +
+                  "reclamación ajena). Este gráfico es la instancia PRIMARIA.", APP_NAME);
       return true;
    }
 
@@ -6813,37 +6900,40 @@ void RetryInstanceLockIfObserver()
    if(handle == INVALID_HANDLE) return;
 
    // Revalidación anti-doble-primaria (igual que en la adquisición inicial):
-   // si otro gráfico escribió un heartbeat fresco, se cede el handle.
+   // si otro gráfico escribió un heartbeat fresco y COMPLETO, se cede el
+   // handle. La validación exige la marca "written" (ver ParseValidatedLockRecord),
+   // de modo que una lectura parcial de una escritura concurrente nunca frena
+   // una promoción legítima ni la permite sobre un heartbeat ajeno vigente.
    g_lock_file_handle = handle;
    g_instance_uid     = (long)ChartID();
    WriteInstanceHeartbeat();
 
-   string uid, hb_text;
-   datetime my_hb = TimeCurrent();
-
-   if(ReadLockFileFields(uid, hb_text))
+   string uid_text, hb_text, written_text;
+   if(ReadLockFileFields(uid_text, hb_text, written_text))
    {
-      datetime hb        = (hb_text == "") ? 0 : StringToTime(hb_text);
-      long     other_uid = (long)StringToInteger(uid);
+      long     other_uid;
+      datetime other_hb;
+      bool valid_other = ParseValidatedLockRecord(uid_text, hb_text, written_text,
+                                                  other_uid, other_hb);
 
-      if(other_uid != 0 && other_uid != g_instance_uid &&
-         hb >= my_hb - 2 && IsLockFileHeldByLiveInstance())
+      if(valid_other && other_uid != g_instance_uid &&
+         (TimeCurrent() - other_hb) <= INSTANCE_HB_STALE_SEC)
       {
          FileClose(g_lock_file_handle);
          g_lock_file_handle    = INVALID_HANDLE;
          g_lock_owner_verified = false;
 
-         PrintFormat("%s: promoción descartada — el chart %I64d escribió un heartbeat más " +
-                     "reciente; esta instancia permanece como OBSERVADOR.",
+         PrintFormat("%s: promoción descartada — el chart %I64d escribió un heartbeat " +
+                     "vigente; esta instancia permanece como OBSERVADOR.",
                      APP_NAME, other_uid);
          return;
       }
    }
 
-   g_lock_file_handle    = handle;
    g_is_primary_instance = true;
    g_lock_owner_verified = true;
    g_lock_attempts       = 0;
+   g_next_lock_retry_ms  = 0; // primaria: no necesita más reintentos de promoción
 
    PrintFormat("%s: PROMOCIÓN a instancia PRIMARIA — el bloqueo %s quedó libre y este gráfico " +
                "lo ha adquirido (revalidado sin heartbeat ajeno). Se reanuda la gestión automática.",
@@ -6875,15 +6965,17 @@ void VerifyLockOwnership()
    if(!g_is_primary_instance || IsTesterContext()) return;
    if(g_lock_file_handle == INVALID_HANDLE)         return;
 
-   string uid, hb_text;
-   if(!ReadLockFileFields(uid, hb_text)) return;
+   string uid_text, hb_text, written_text;
+   if(!ReadLockFileFields(uid_text, hb_text, written_text)) return;
 
-   long     other_uid = (long)StringToInteger(uid);
-   datetime hb        = (hb_text == "") ? 0 : StringToTime(hb_text);
+   long     other_uid;
+   datetime other_hb;
+   if(!ParseValidatedLockRecord(uid_text, hb_text, written_text, other_uid, other_hb))
+      return;
 
-   if(other_uid == 0 || other_uid == g_instance_uid || hb <= 0) return;
+   if(other_uid == 0 || other_uid == g_instance_uid) return;
 
-   bool other_fresh = (TimeCurrent() - hb) <= ((INSTANCE_HB_PERIOD_MS / 1000) * 6);
+   bool other_fresh = (TimeCurrent() - other_hb) <= INSTANCE_HB_STALE_SEC;
    if(!other_fresh) return;
 
    if(other_uid > g_instance_uid)
@@ -6900,6 +6992,7 @@ void VerifyLockOwnership()
    g_is_primary_instance   = false;
    g_lock_owner_verified   = false;
    g_lock_attempts         = 0;
+   g_next_lock_retry_ms    = NowMs() + (ulong)INSTANCE_LOCK_RETRY_MS;
 
    PrintFormat("%s: DEGRADACIÓN a OBSERVADOR — otra instancia (chart %I64d) adquirió el " +
                "bloqueo %s. Esta instancia deja de ejecutar y gestionar automáticamente.",
@@ -6917,10 +7010,17 @@ void WriteInstanceHeartbeat()
 
    FileSeek(g_lock_file_handle, 0, SEEK_SET);
 
+   // "written" es deliberadamente lo ÚLTIMO que se escribe: quien lea el
+   // archivo mientras esta escritura está en curso verá un heartbeat nuevo sin
+   // marca "written" (o con una distinta) y descartará el registro como
+   // incompleto (ver ParseValidatedLockRecord). Es la salvaguarda de integridad
+   // de lectura del protocolo anti doble-primaria.
+   string stamp = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS);
+
    string content = LOCK_HEADER_V1 + "\n" +
-                    StringFormat("uid=%I64d\nchart=%I64d\nsymbol=%s\nmagic=%d\nheartbeat=%s\n",
+                    StringFormat("uid=%I64d\nchart=%I64d\nsymbol=%s\nmagic=%d\nheartbeat=%s\nwritten=%s\n",
                                  g_instance_uid, ChartID(), _Symbol, InpMagicNumber,
-                                 TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS));
+                                 stamp, stamp);
 
    static int s_max_written_len = 0;
    int content_len = StringLen(content);
@@ -7094,86 +7194,6 @@ bool ModifyPositionLevels(ulong ticket, double sl, double tp, string context)
    return false;
 }
 
-bool CancelPendingOrder(ulong order_ticket, string context)
-{
-   if(order_ticket == 0) return false;
-
-   bool deleted = false;
-
-   for(int attempt = 1; attempt <= CANCEL_MAX_ATTEMPTS; attempt++)
-   {
-      if(!OrderSelect(order_ticket))
-      {
-         deleted = true;
-         break;
-      }
-
-      bool request_ok = g_trade_object.OrderDelete(order_ticket);
-      uint retcode    = g_trade_object.ResultRetcode();
-
-      if(request_ok && IsSuccessfulTradeRetcode(retcode))
-         deleted = true;
-
-      if(deleted) break;
-
-      if(!IsRetryableRetcode(retcode))
-      {
-         LogExecution(StringFormat("No se pudo cancelar la orden %I64u (%s): %s.",
-                                   order_ticket, context, TradeResultText()), true);
-         return false;
-      }
-
-      // A2: en cuenta real NO se usa Sleep() (bloquea el hilo del EA y puede
-      // retrasar trailing/BE de otras posiciones varios segundos). El retry
-      // queda diferido al siguiente tick con una espera pasiva basada en
-      // TimeCurrent(). En el tester no hay servidor que saturarse, así que
-      // se mantiene Sleep para no depender de ticks adicionales.
-      if(IsTesterContext())
-      {
-         Sleep((int)MathMin(MAX_BACKOFF_MS, g_backoff_base * attempt));
-      }
-      else
-      {
-         int wait_sec = (int)MathMax(1, MathMin(5, g_backoff_base * attempt / 1000));
-         datetime until = TimeCurrent() + wait_sec;
-         while(TimeCurrent() < until && !IsStopped())
-            Sleep(200); // sub-segundo: cede CPU sin congelar gestión >5 s por intento
-      }
-   }
-
-   if(OrderSelect(order_ticket))
-   {
-      LogExecution(StringFormat("La orden pendiente %I64u sigue activa tras cancelarla (%s): %s.",
-                                order_ticket, context, TradeResultText()), true);
-      return false;
-   }
-
-   if(!deleted) return false;
-
-   LogExecution(StringFormat("Orden pendiente %I64u cancelada (%s).",
-                             order_ticket, context), false);
-
-   int idx = FindPositionByOrderTicket(order_ticket);
-   if(idx >= 0)
-   {
-      g_positions[idx].order_ticket = 0;
-      g_positions[idx].is_locked    = false;
-      UpdatePositionObjects(idx);
-   }
-
-   if(g_pending_fill_order == order_ticket)
-   {
-      g_pending_fill_order   = 0;
-      g_pending_fill_zone_id = -1;
-      g_pending_fill_ms      = 0;
-   }
-
-   MarkStateDirty();
-   MarkPanelDirty();
-
-   return true;
-}
-
 bool CancelAllPendingOrders(string context)
 {
    bool all_ok = true;
@@ -7323,6 +7343,207 @@ bool IsRetryableRetcode(uint retcode)
          return true;
    }
    return false;
+}
+
+// M-1: encolar una cancelación pendiente de reintento. Se usa cuando el
+// servidor rechaza el borrado con un retcode recuperable: en lugar de dormir
+// el hilo del EA (Sleep bloquea OnTick/OnTimer y retrasa trailing/BE de otras
+// posiciones), la orden queda encolada y ProcessPendingCancels() la reintenta
+// desde OnTick/OnTimer cuando llega su momento.
+void QueuePendingCancel(ulong order_ticket, int attempt, ulong delay_ms, string context)
+{
+   if(order_ticket == 0) return;
+
+   for(int i = 0; i < ArraySize(g_pending_cancels); i++)
+   {
+      if(g_pending_cancels[i].order_ticket == order_ticket)
+      {
+         g_pending_cancels[i].attempt       = attempt;
+         g_pending_cancels[i].next_retry_ms = NowMs() + delay_ms;
+         g_pending_cancels[i].context       = context;
+         return;
+      }
+   }
+
+   int n = ArraySize(g_pending_cancels);
+   ArrayResize(g_pending_cancels, n + 1);
+
+   g_pending_cancels[n].order_ticket  = order_ticket;
+   g_pending_cancels[n].attempt       = attempt;
+   g_pending_cancels[n].next_retry_ms = NowMs() + delay_ms;
+   g_pending_cancels[n].context       = context;
+}
+
+void RemovePendingCancelAt(int idx)
+{
+   int total = ArraySize(g_pending_cancels);
+   if(idx < 0 || idx >= total) return;
+
+   for(int i = idx; i < total - 1; i++)
+      g_pending_cancels[i] = g_pending_cancels[i + 1];
+
+   ArrayResize(g_pending_cancels, total - 1);
+}
+
+bool CancelPendingOrder(ulong order_ticket, string context)
+{
+   if(order_ticket == 0) return false;
+
+   // Si ya hay una cancelación encolada para esta orden, no se duplica el
+   // esfuerzo: se devuelve "no completada" y la cola seguirá reintentando.
+   for(int q = 0; q < ArraySize(g_pending_cancels); q++)
+      if(g_pending_cancels[q].order_ticket == order_ticket) return false;
+
+   if(!OrderSelect(order_ticket))
+   {
+      // Ya no existe en el libro: o se canceló antes o fue ejecutada.
+      // La reconciliación vía OnTradeTransaction determinará el caso.
+      FinishPendingCancel(order_ticket, true, context);
+      return true;
+   }
+
+   bool request_ok = g_trade_object.OrderDelete(order_ticket);
+   uint retcode    = g_trade_object.ResultRetcode();
+
+   if(request_ok && IsSuccessfulTradeRetcode(retcode))
+   {
+      FinishPendingCancel(order_ticket, true, context);
+      return true;
+   }
+
+   // El borrado puede tardar en propagarse aunque la petición haya sido
+   // aceptada: si la orden ya no está en el libro, se da por cancelada.
+   if(!OrderSelect(order_ticket))
+   {
+      FinishPendingCancel(order_ticket, true, context);
+      return true;
+   }
+
+   if(!IsRetryableRetcode(retcode))
+   {
+      LogExecution(StringFormat("No se pudo cancelar la orden %I64u (%s): %s.",
+                                order_ticket, context, TradeResultText()), true);
+      FinishPendingCancel(order_ticket, false, context);
+      return false;
+   }
+
+   // Retry diferido SIN Sleep(): primer reintento inmediato al siguiente
+   // tick/timer y los posteriores con backoff creciente (máx. 5 s). El intento
+   // nº 1 se ha consumido aquí, por lo que el primero de la cola es el nº 2.
+   int next_attempt = 2;
+   ulong delay_ms   = (ulong)MathMax(250, MathMin(5000, g_backoff_base * next_attempt));
+
+   QueuePendingCancel(order_ticket, next_attempt, delay_ms, context);
+
+   LogExecution(StringFormat("La cancelación de la orden %I64u quedó encolada (%s): %s. " +
+                             "Se reintentará sin bloquear la gestión.",
+                             order_ticket, context, TradeResultText()), false);
+
+   return false;
+}
+
+// Finaliza la cancelación de una orden: limpia estado local, zona asociada y
+// pendings de ejecución. `success` indica si la orden quedó efectivamente
+// fuera del libro.
+void FinishPendingCancel(ulong order_ticket, bool success, string context)
+{
+   for(int q = ArraySize(g_pending_cancels) - 1; q >= 0; q--)
+      if(g_pending_cancels[q].order_ticket == order_ticket)
+         RemovePendingCancelAt(q);
+
+   if(!success) return;
+
+   LogExecution(StringFormat("Orden pendiente %I64u cancelada (%s).",
+                             order_ticket, context), false);
+
+   int idx = FindPositionByOrderTicket(order_ticket);
+   if(idx >= 0)
+   {
+      g_positions[idx].order_ticket = 0;
+      g_positions[idx].is_locked    = false;
+      UpdatePositionObjects(idx);
+   }
+
+   if(g_pending_fill_order == order_ticket)
+   {
+      g_pending_fill_order   = 0;
+      g_pending_fill_zone_id = -1;
+      g_pending_fill_ms      = 0;
+   }
+
+   MarkStateDirty();
+   MarkPanelDirty();
+}
+
+// Reintentos diferidos de cancelación — se llama desde OnTick y OnTimer.
+// Recorrido ASCENDENTE con re-scaneo explícito: FinishPendingCancel puede
+// retirar elementos en cualquier posición (acorta el array y desplaza los
+// índices), por lo que no es seguro asumir que el índice local sigue vigente.
+void ProcessPendingCancels()
+{
+   if(ArraySize(g_pending_cancels) == 0) return;
+   if(IsStopped()) return;
+
+   ulong now = NowMs();
+
+   for(int i = 0; i < ArraySize(g_pending_cancels); i++)
+   {
+      ulong  ticket   = g_pending_cancels[i].order_ticket;
+      int    attempt  = g_pending_cancels[i].attempt;
+      ulong  retry_at = g_pending_cancels[i].next_retry_ms;
+      string ctx      = g_pending_cancels[i].context;
+
+      if(now < retry_at) continue;
+
+      if(!OrderSelect(ticket))
+      {
+         FinishPendingCancel(ticket, true, ctx);
+         i = -1; // cola posiblemente acortada/desplazada: reiniciar barrido
+         continue;
+      }
+
+      bool request_ok = g_trade_object.OrderDelete(ticket);
+      uint retcode    = g_trade_object.ResultRetcode();
+
+      bool deleted_now = request_ok && IsSuccessfulTradeRetcode(retcode);
+
+      if(!deleted_now && !OrderSelect(ticket))
+         deleted_now = true; // propagación completada entre bastidores
+
+      if(deleted_now)
+      {
+         FinishPendingCancel(ticket, true, ctx);
+         i = -1;
+         continue;
+      }
+
+      if(!IsRetryableRetcode(retcode) || attempt >= CANCEL_MAX_ATTEMPTS)
+      {
+         LogExecution(StringFormat("La orden pendiente %I64u sigue activa tras %d intentos " +
+                                   "de cancelación (%s): %s. Intervenga manualmente.",
+                                   ticket, attempt, ctx, TradeResultText()), true);
+         FinishPendingCancel(ticket, false, ctx);
+         i = -1;
+         continue;
+      }
+
+      attempt++;
+      ulong delay_ms = (ulong)MathMax(250, MathMin(5000, g_backoff_base * attempt));
+
+      // Localizar de nuevo (los índices pueden haber cambiado al retirar otros).
+      for(int j = 0; j < ArraySize(g_pending_cancels); j++)
+      {
+         if(g_pending_cancels[j].order_ticket == ticket)
+         {
+            g_pending_cancels[j].attempt       = attempt;
+            g_pending_cancels[j].next_retry_ms = now + delay_ms;
+            break;
+         }
+      }
+
+      // Este elemento ya fue procesado en esta pasada; avanzar sin re-barrer
+      // (no se retiró ningún elemento, así que los índices siguen vigentes).
+   }
 }
 
 // C2: retcodes "ambiguos" — el servidor PUDO haber ejecutado la orden aunque no
@@ -8108,8 +8329,37 @@ void ApplyPartials(int m)
       double live_volume = PositionGetDouble(POSITION_VOLUME);
       if(live_volume <= 0.0) return;
 
-      double target = g_management[m].volume_original *
-                      (g_management[m].plan_stage_pct[s] / 100.0);
+      // C-2: el porcentaje del parcial se aplica sobre el volumen VIVO de la
+      // posición, no sobre el volumen original del plan. Si el usuario redujo
+      // la posición manualmente (o un parcial previo ya cerró parte), calcular
+      // sobre volume_original podía hacer que ClosePositionVolume escalara al
+      // cierre TOTAL (el resto quedaba por debajo del mínimo) sin ninguna
+      // confirmación explícita. Con el cálculo sobre el volumen vivo, un
+      // parcial siempre cierra exactamente su porcentaje de lo que queda; y si
+      // aun así el tramo restante resulta inferior al lote mínimo y el cierre
+      // acaba siendo total, se emite una ALERTA explícita antes de enviar la
+      // petición (ver ClosePositionVolume).
+      double target = live_volume * (g_management[m].plan_stage_pct[s] / 100.0);
+
+      bool will_close_entire_position = false;
+      {
+         bool   below_min_chk;
+         double norm_target = NormalizeVolume(_Symbol, MathMin(target, live_volume),
+                                              below_min_chk);
+         double min_vol_chk = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+         double rem_chk     = live_volume - norm_target;
+
+         will_close_entire_position = (below_min_chk || norm_target <= 0.0 ||
+                                       (rem_chk > 0.0 && rem_chk < min_vol_chk - 1e-9));
+
+         if(will_close_entire_position && target < live_volume * 0.999)
+            Alert(StringFormat("%s: el parcial %d del ticket %I64u (%s%% de %s lotes) cerrará " +
+                               "la posición COMPLETA porque el resto quedaría por debajo del " +
+                               "mínimo del símbolo.",
+                               APP_NAME, s + 1, g_management[m].ticket,
+                               DoubleToString(g_management[m].plan_stage_pct[s], 1),
+                               DoubleToString(live_volume, VolumeDecimalsFromStep(_Symbol))));
+      }
 
       if(ClosePositionVolume(g_management[m].ticket, target,
                              StringFormat("parcial %d", s + 1)))
@@ -8118,6 +8368,12 @@ void ApplyPartials(int m)
          g_management[m].partial_executed[s]        = true;
          g_management[m].partial_executed_volume[s] = MathMin(target, live_volume);
          g_management[m].partial_fail_count[s]      = 0;
+
+         if(will_close_entire_position)
+            LogExecution(StringFormat("El parcial %d del ticket %I64u cerró la posición " +
+                                      "COMPLETA (el resto tras el parcial quedaba por debajo " +
+                                      "del volumen mínimo).",
+                                      s + 1, g_management[m].ticket), true);
 
          int zone_idx = FindPositionByPositionTicket(g_management[m].ticket);
          if(zone_idx >= 0)
@@ -9084,7 +9340,24 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   AcquireInstanceLock();
+   if(!AcquireInstanceLock() && !g_is_primary_instance && !InpForcePrimaryOnLockFailure)
+   {
+      // M-4: si el bloqueo quedó en manos de OTRA instancia viva, continuar
+      // aquí sería contradictorio: más abajo se restaura el estado persistido,
+      // se adoptan huérfanas y la otra primaria podría sobreescribir este
+      // archivo de estado. El gráfico arranca DIRECTAMENTE en modo observador
+      // (solo visualización; OnTimer reintenta la promoción cada
+      // INSTANCE_LOCK_RETRY_MS) y no escribe estado ni configuración.
+      BuildPanel();
+      RebuildAllZoneObjects();
+      UpdatePanelInfo();
+      ChartRedraw(0);
+
+      SetPanelStatus("Modo observador: otra instancia gestiona este símbolo/magic. " +
+                     "Este gráfico no ejecuta, no gestiona y no guarda estado.", true);
+      PrintFormat("%s: OnInit completado en MODO OBSERVADOR por conflicto de bloqueo.", APP_NAME);
+      return INIT_SUCCEEDED;
+   }
 
    LoadSavedConfig();
    ClampLiveSettings();
@@ -9099,9 +9372,28 @@ int OnInit()
 
    if(InpForceResetStateNow)
    {
-      PrintFormat("%s: InpForceResetStateNow=true — se fuerza un arranque limpio, " +
-                  "descartando cualquier estado guardado.", APP_NAME);
-      ClearPersistedPositionsState();
+      // M-5: borrar el estado con posiciones vivas del magic en mercado era
+      // una contradicción: las huérfanas se re-adoptaban sin plan (parciales/
+      // BE/trailing congelados perdidos) y los límites diarios se reseteaban
+      // involuntariamente. Ahora el borrado forzado SOLO se ejecuta si no hay
+      // posiciones vivas; con posiciones abiertas se conserva el estado y se
+      // avisa (use CERRAR TODO primero si de verdad quiere partir de cero).
+      if(HasLiveEAPositions())
+      {
+         PrintFormat("%s: InpForceResetStateNow=true se IGNORA porque hay posiciones vivas " +
+                     "con el magic %d; forrar el borrado dejaría esas posiciones sin plan de " +
+                     "gestión y reiniciaría los límites diarios. Ciérrelas primero si desea " +
+                     "un arranque limpio.", APP_NAME, InpMagicNumber);
+         if(InpEnablePushNotifications && !IsTesterContext())
+            SendNotification(StringFormat("%s %s: InpForceResetStateNow ignorado (hay " +
+                                          "posiciones vivas).", APP_NAME, _Symbol));
+      }
+      else
+      {
+         PrintFormat("%s: InpForceResetStateNow=true — se fuerza un arranque limpio, " +
+                     "descartando cualquier estado guardado.", APP_NAME);
+         ClearPersistedPositionsState();
+      }
    }
 
    LoadPositionsState();
@@ -9210,6 +9502,9 @@ void OnTick()
 
    if(g_plan.active) ProcessOrderPlan();
 
+   // M-1: reintentos diferidos de cancelación sin bloquear el hilo del EA.
+   ProcessPendingCancels();
+
    ulong now = NowMs();
 
    if(now >= g_next_limits_ms)
@@ -9273,6 +9568,10 @@ void OnTimer()
    }
 
    if(g_plan.active) ProcessOrderPlan();
+
+   // M-1: los reintentos de cancelación también avanzan con el timer, para
+   // que una orden encolada se resuelva aunque el símbolo esté ilíquido.
+   ProcessPendingCancels();
 
    ProcessFlatten();
 
@@ -9376,7 +9675,18 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          InvalidateBalanceOpsCache();
       }
 
-      if((int)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagicNumber) return;
+      // C-1: los deals ajenos al magic también cambian el estado de la cuenta
+      // (y pueden afectar a posiciones adoptadas o compartidas). Antes se
+      // retornaba sin marcar el estado como sucio, dejando una ventana de
+      // riesgo ante reinicios (el estado guardado quedaba obsoleto sin
+      // volcarse). Se marca SIEMPRE, y solo se omite la lógica específica del
+      // EA para deals de otro magic.
+      if((int)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagicNumber)
+      {
+         MarkStateDirty();
+         MarkPanelDirty();
+         return;
+      }
 
       ulong position_id = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
       long  entry       = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
