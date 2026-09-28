@@ -296,7 +296,10 @@ input color InpColorTP_Default          = C'22,178,133';
 input color InpColorSL_Default          = C'236,72,88';
 input color InpColorEntry_Default       = C'150,157,171';
 input color InpColorStats_Default       = C'237,240,246';
-input int   InpZoneTransparency_Default = 80;
+// Nota: el valor por defecto se limita a 92 en tiempo de ejecución para que
+// el relleno de las zonas quede siempre semitransparente (máx. 8% de opacidad)
+// y no oculte las velas. El usuario puede subirlo manualmente hasta 100.
+input int   InpZoneTransparency_Default = 92;
 input int   InpFontSizeStats_Default    = 8;
 input int   InpLineWidth_Default        = 1;
 input bool  InpShowLevels_Default       = true;
@@ -1401,9 +1404,15 @@ string TradeResultText()
 //+------------------------------------------------------------------+
 //| UTILIDADES - COLOR                                               |
 //+------------------------------------------------------------------+
+// Rango efectivo de transparencia: se limita a [0..92] para que el relleno de
+// las zonas conserve siempre un mínimo de translucidez (~8% de opacidad) y no
+// llegue a ocultar por completo las velas ni los niveles del gráfico.
+// El usuario sigue pudiendo elegir cualquier valor dentro de ese rango.
+#define ZONE_TRANSPARENCY_MAX_EFFECTIVE 92
+
 color ApplyTransparency(color original, int percent)
 {
-   percent = (int)MathMax(0, MathMin(100, percent));
+   percent = (int)MathMax(0, MathMin(ZONE_TRANSPARENCY_MAX_EFFECTIVE, percent));
 
    int src = (int)original;
    int bg  = (int)ChartGetInteger(0, CHART_COLOR_BACKGROUND);
@@ -2524,6 +2533,24 @@ string ZoneTooltipText(int idx)
                        DoubleToString(pos.sl_price,    digits));
 }
 
+// Devuelve el ratio R:R de la zona formateado como texto ("1:2.4"), o "" si no
+// es calculable (zona inválida, volumen nulo o riesgo cero). Se usa tanto en
+// la etiqueta de estadísticas como en el tooltip de las zonas.
+string ZoneRRText(int idx)
+{
+   if(idx < 0 || idx >= ArraySize(g_positions)) return "";
+
+   EnsureZoneVolume(idx);
+
+   SVisualPosition pos = g_positions[idx];
+   double risk_money, reward_money, rr;
+
+   if(!ZoneMoneyMetrics(pos, pos.qty, risk_money, reward_money, rr)) return "";
+   if(rr <= 0.0) return "";
+
+   return StringFormat("R:R 1:%.1f", rr);
+}
+
 //+------------------------------------------------------------------+
 //| POSICIONES - CREACIÓN DE OBJETOS GRÁFICOS                        |
 //+------------------------------------------------------------------+
@@ -2538,6 +2565,11 @@ void StyleZoneRectangle(string name, color fill, bool selected)
    SetObjInt(name, OBJPROP_SELECTED,   false);
    SetObjInt(name, OBJPROP_HIDDEN,     true);
    SetObjInt(name, OBJPROP_ZORDER,     selected ? 2 : 1);
+
+   // Borde sutil del mismo tono que el relleno: en los bordes la línea del
+   // rectángulo se dibuja con opacidad completa, lo que produce un efecto de
+   // contorno limpio estilo TradingView sin tapar las velas del interior.
+   SetObjInt(name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
 }
 
 void StyleZoneLine(string name, color line_color, int width, ENUM_LINE_STYLE style)
@@ -2759,7 +2791,10 @@ void StyleZoneHandle(string name, color border_c, color fill_c, int size_px, int
    SetObjInt(name, OBJPROP_YSIZE,       size_px);
    SetObjInt(name, OBJPROP_BGCOLOR,     fill_c);
    SetObjInt(name, OBJPROP_COLOR,       border_c);
-   SetObjInt(name, OBJPROP_BORDER_TYPE, BORDER_RAISED);
+   // BORDER_FLAT en lugar de BORDER_RAISED: el biselado "en relieve" tiene un
+   // aspecto anticuado (estilo Windows clásico). Con borde plano de 1px el
+   // handle se ve como un punto minimalista, más parecido a TradingView.
+   SetObjInt(name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
    SetObjInt(name, OBJPROP_WIDTH,       1);
    SetObjInt(name, OBJPROP_BACK,        false);
    SetObjInt(name, OBJPROP_SELECTABLE,  false);
@@ -2868,8 +2903,13 @@ void UpdatePositionObjects(int idx)
    double stats_anchor_price = pos.entry_price - PixelsToPriceDistance(STATS_LABEL_GAP_PX);
    if(stats_anchor_price <= 0.0) stats_anchor_price = pos.entry_price;
 
+   // Etiqueta compacta "R:R 1:x.x" bajo la entrada (evita solaparse con las
+   // etiquetas de nivel, que se anclan a la derecha del borde derecho).
+   string rr_text = ZoneRRText(idx);
+
    UpdateZoneText(ObjectNameForPosition(pos.id, "TXT_STATS"), t2, stats_anchor_price,
-                  "  " + ZoneStatsText(idx), InpColorStats, ANCHOR_LEFT_UPPER, show_labels);
+                  "  " + rr_text, InpColorStats, ANCHOR_LEFT_UPPER,
+                  show_labels && rr_text != "");
 
    for(int s = 0; s < PARTIAL_STAGES; s++)
    {
@@ -2894,8 +2934,15 @@ void UpdatePositionObjects(int idx)
    }
 
    SetTooltipSafe(ObjectNameForPosition(pos.id, "LINE_ENTRY"), "\n");
-   SetTooltipSafe(ObjectNameForPosition(pos.id, "RECT_TP"),    "\n");
-   SetTooltipSafe(ObjectNameForPosition(pos.id, "RECT_SL"),    "\n");
+
+   // Tooltip informativo en las zonas: al pasar el ratón se ven los niveles y
+   // el R:R sin necesidad de seleccionar la posición (antes estaba vacío).
+   string zone_tooltip = ZoneTooltipText(idx);
+   if(zone_tooltip != "")
+      SetTooltipSafe(ObjectNameForPosition(pos.id, "RECT_TP"), zone_tooltip);
+   else
+      SetTooltipSafe(ObjectNameForPosition(pos.id, "RECT_TP"), "\n");
+   SetTooltipSafe(ObjectNameForPosition(pos.id, "RECT_SL"), "\n");
 
    bool show_handles = show_active && !pos.is_degenerate && !pos.is_closed;
 
@@ -2906,14 +2953,21 @@ void UpdatePositionObjects(int idx)
    bool show_entry_handle_right = show_handles && (!pos.is_locked || entry_locked_draft);
 
    const int HANDLE_ZORDER = 15;
-   const int HANDLE_SIZE   = 12;
+   // Handle algo más compacto: aspecto minimalista tipo TradingView.
+   const int HANDLE_SIZE   = 10;
+
+   // Color de relleno del handle según su función (los handles comparten el
+   // mismo z-order, así que el color es la única señal visual fiable):
+   // verde/rojo para niveles TP/SL y acento azul para la línea de entrada.
+   color tp_handle_fill = ApplyTransparency(InpColorTP, 25);
+   color sl_handle_fill = ApplyTransparency(InpColorSL, 25);
 
    UpdateZoneHandle(ObjectNameForPosition(pos.id, "HANDLE_TP_L"), t1, pos.tp_price,
-                    show_handles, ColorAccent(), ColorBackground(),
+                    show_handles, ColorAccent(), tp_handle_fill,
                     HANDLE_SIZE, HANDLE_ZORDER);
 
    UpdateZoneHandle(ObjectNameForPosition(pos.id, "HANDLE_SL_L"), t1, pos.sl_price,
-                    show_handles, ColorAccent(), ColorBackground(),
+                    show_handles, ColorAccent(), sl_handle_fill,
                     HANDLE_SIZE, HANDLE_ZORDER);
 
    SafeObjectDelete(ObjectNameForPosition(pos.id, "HANDLE_TP_R"));
@@ -2923,7 +2977,7 @@ void UpdatePositionObjects(int idx)
                     show_entry_handle_left, ColorAccent(), ColorBackground(),
                     HANDLE_SIZE, HANDLE_ZORDER);
    UpdateZoneHandle(ObjectNameForPosition(pos.id, "HANDLE_ENTRY_R"), t2, pos.entry_price,
-                    show_entry_handle_right, ColorAccent(), ColorBackground(),
+                    show_entry_handle_right, ColorAccent(), entry_color,
                     HANDLE_SIZE, HANDLE_ZORDER);
 }
 
