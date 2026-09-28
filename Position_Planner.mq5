@@ -1031,6 +1031,10 @@ bool IsManagementValid(int idx)
 
 void UpdateUI(bool force_redraw = false)
 {
+   // En tester no-visual la UI está desactivada (sin panel ni objetos):
+   // evitar cualquier llamada a ChartRedraw para no frenar el backtest.
+   if(IsSilentTesterMode()) return;
+
    if(g_panel_dirty)
       UpdatePanelInfo();
 
@@ -1049,6 +1053,15 @@ bool IsTesterContext()
    return (MQLInfoInteger(MQL_TESTER)       != 0 ||
            MQLInfoInteger(MQL_OPTIMIZATION) != 0 ||
            MQLInfoInteger(MQL_FORWARD)      != 0);
+}
+
+// Modo "silencioso" para el Strategy Tester: en backtest NO-visual no tiene
+// sentido construir el panel gráfico ni lanzar el timer de refresco a 100 ms
+// (ralentiza la optimización y genera miles de objetos sin usar). En modo
+// visual sí se construye, porque el usuario necesita ver y manejar el panel.
+bool IsSilentTesterMode()
+{
+   return (IsTesterContext() && MQLInfoInteger(MQL_VISUAL_MODE) == 0);
 }
 
 ulong NowMs()
@@ -2916,6 +2929,8 @@ void UpdatePositionObjects(int idx)
 
 void RebuildAllZoneObjects()
 {
+   if(IsSilentTesterMode()) return; // sin objetos gráficos en tester no-visual
+
    DeleteAllZoneObjects();
 
    for(int i = 0; i < ArraySize(g_positions); i++)
@@ -3909,6 +3924,10 @@ bool PanelEdit(string suffix, int x, int y, int w, int h, string text, bool enab
 //+------------------------------------------------------------------+
 void BuildPanel()
 {
+   // Modo silencioso (tester no-visual): no se construye el panel; todas las
+   // rutas de UI quedan inactivas porque comprueban g_panel_built.
+   if(IsSilentTesterMode()) return;
+
    g_suppress_object_events++;
 
    int top_y = PanelTopY();
@@ -9350,8 +9369,11 @@ int OnInit()
       // INSTANCE_LOCK_RETRY_MS) y no escribe estado ni configuración.
       BuildPanel();
       RebuildAllZoneObjects();
-      UpdatePanelInfo();
-      ChartRedraw(0);
+      if(!IsSilentTesterMode())
+      {
+         UpdatePanelInfo();
+         ChartRedraw(0);
+      }
 
       SetPanelStatus("Modo observador: otra instancia gestiona este símbolo/magic. " +
                      "Este gráfico no ejecuta, no gestiona y no guarda estado.", true);
@@ -9381,7 +9403,7 @@ int OnInit()
       if(HasLiveEAPositions())
       {
          PrintFormat("%s: InpForceResetStateNow=true se IGNORA porque hay posiciones vivas " +
-                     "con el magic %d; forrar el borrado dejaría esas posiciones sin plan de " +
+                     "con el magic %d; forzar el borrado dejaría esas posiciones sin plan de " +
                      "gestión y reiniciaría los límites diarios. Ciérrelas primero si desea " +
                      "un arranque limpio.", APP_NAME, InpMagicNumber);
          if(InpEnablePushNotifications && !IsTesterContext())
@@ -9429,8 +9451,11 @@ int OnInit()
                   : "Modo observador: este gráfico no ejecuta ni gestiona operaciones.",
                   !g_is_primary_instance);
 
-   UpdatePanelInfo();
-   ChartRedraw(0);
+   if(!IsSilentTesterMode())
+   {
+      UpdatePanelInfo();
+      ChartRedraw(0);
+   }
 
    return INIT_SUCCEEDED;
 }
@@ -9529,7 +9554,7 @@ void OnTick()
 
    if(g_show_pnl) MarkPanelDirty();
 
-   if(g_needs_redraw)
+   if(!IsSilentTesterMode() && g_needs_redraw)
    {
       ChartRedraw(0);
       g_needs_redraw = false;
